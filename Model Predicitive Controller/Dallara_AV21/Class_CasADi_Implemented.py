@@ -3,7 +3,8 @@ from scipy.linalg import block_diag
 import sympy as sym
 import casadi as cas
 from casadi import *
-
+import time
+import csv
 
 class Dallara_WMPC:
     def __init__(self) -> None:
@@ -43,7 +44,7 @@ class Dallara_WMPC:
         self.ks = (ksf+ksr)/2
         self.bs = (bsf+bsr)/2
     
-    def set_state(self, xd, yd, speed, sideslipangle, wheel_speed, mux, muy, W0, phir, x0):
+    def set_state(self, xd, yd, speed, sideslipangle, wheel_speed, mux, muy, W0, phir, x0, current_acc, current_pos, current_ttl_index, current_pitch_rate):
         self.xd = xd
         self.yd = yd
         self.speed = speed
@@ -54,20 +55,24 @@ class Dallara_WMPC:
         self.W0 = W0
         self.phir = phir # That's it right?
         self.x0 = x0
-        self.x0[1] = self.lat_vel
+        self.x0[1] = -self.lat_vel
+        self.current_acc = current_acc
+        self.current_pos = current_pos
+        self.current_ttl_index = current_ttl_index
+        self.current_pitch_rate = current_pitch_rate
 
     def load_estimator(self,u):
         faero_f = (309.6*(u/67.056)**2)/2.2 # Based on curve fir at rrh = 12.5 mm and frh = 10 mm
         faero_r = (668.7*(u/67.056)**2)/2.2 # Based on curve fir at rrh = 12.5 mm and frh = 10 mm
-        fz1 = self.m*self.g/4 +self.ksf*self.ls/4*np.sin(self.x0[3])+self.bsf*self.ls/4*self.x0[4]*np.cos(self.x0[3])+faero_f/2
-        fz2 = self.m * self.g / 4 -  self.ksf * self.ls / 4 * np.sin(self.x0[3]) - self.bsf * self.ls / 4 * self.x0[4] * np.cos(self.x0[3])+faero_f/2
-        fz3 = self.m * self.g / 4 + self.ksr * self.ls / 4 * np.sin(self.x0[3]) + self.bsr * self.ls / 4 * self.x0[
+        fz1 = self.m*self.g/4 -self.ksf*self.ls/4*np.sin(self.x0[3])-self.bsf*self.ls/4*self.x0[4]*np.cos(self.x0[3])+faero_f/2
+        fz2 = self.m * self.g / 4 +  self.ksf * self.ls / 4 * np.sin(self.x0[3]) + self.bsf * self.ls / 4 * self.x0[4] * np.cos(self.x0[3])+faero_f/2
+        fz3 = self.m * self.g / 4 - self.ksr * self.ls / 4 * np.sin(self.x0[3]) - self.bsr * self.ls / 4 * self.x0[
             4] * np.cos(self.x0[3])+faero_r/2
-        fz4 = self.m * self.g / 4 - self.ksr * self.ls / 4 * np.sin(self.x0[3]) - self.bsr * self.ls / 4 * self.x0[
+        fz4 = self.m * self.g / 4 + self.ksr * self.ls / 4 * np.sin(self.x0[3]) + self.bsr * self.ls / 4 * self.x0[
             4] * np.cos(self.x0[3])+faero_r/2
         fz0 = np.array([fz1, fz2, fz3, fz4])
         return fz0
-
+    
     def slip_angle_estimator(self,u):
         slip_angle_1 = self.W0[1] - (self.x0[1] + self.lf * self.x0[2]) / u * np.ones((2,))
         slip_angle_2 = -(self.x0[1] - self.lr * self.x0[2]) / u * np.ones((2,))
@@ -228,20 +233,23 @@ class Dallara_WMPC:
         yd:desired lateral position                          --- (scalar)
         N: MPC Prediction horizon                            --- (scalar)
         """
-        u,v = self.speed_estimation()
+        start_time = time.time()
+        #u,v = self.speed_estimation()
+        u = self.speed
         psi_desired = np.arctan(self.yd / self.xd)
         if u != 0.0:
             delta1 = psi_desired - self.x0[1] / u
-            u = np.max((u, 15.0))
+            u = np.max((u, 10.0))
         else:
             delta1 = psi_desired
-            u = np.max((u,15))
+            u = np.max((u,10))
 
         fz0 = self.load_estimator(u)
         slip_angle = self.slip_angle_estimator(u)
         slip_ratio = self.slip_ratio_estimator(u)
-
-
+        self.phir = self.x0[3]
+        print(self.phir)
+        print(self.x0)
         # Tire model Linearization
         fy1, ca1, a1 = self.DugoffLinearizer(slip_angle[0], slip_ratio[0], self.ca[0], self.cs[0], self.mux, fz0[0])
         fy2, ca2, a2 = self.DugoffLinearizer(slip_angle[1], slip_ratio[1], self.ca[1], self.cs[1], self.mux, fz0[1])
@@ -290,24 +298,64 @@ class Dallara_WMPC:
 
         # Vehicle Body Dynamics y vy psi,psidot roll, rollrate
         # Equations written in block 1 below
-        den = 2 * self.m * (self.ixx + self.hs ** 2 * self.m + self.hs ** 2 * self.ms)
-        Af = np.array([[0, 1, 0, 0, 0],
-                       [0, 0, -u, (self.hs * self.ks * self.ls ** 2 * self.ms + 2 * self.g * self.ixx * self.m + 2 * self.g * self.hs ** 2 * self.m ** 2) / den,
-                        self.bs * self.hs * self.ls ** 2 * self.ms / den], [0, 0, 0, 0, 0], [0, 0, 0, 0, 1],
-                       [0, 0, 0, (2 * self.g * self.hs * self.m * self.m - self.ks * self.ls ** 2 * self.m) / den, -self.bs * self.ls * self.ls * self.m / den]])
-        Bf = np.array(
-            [[0, 0, 0], [0, 2 * (self.ixx + self.m * self.hs ** 2) / den, 0], [0, 0, 1 / self.iz], [0, 0, 0], [0, 2 * self.m * self.hs / den, 0]])
-        Cpr = np.array([[0], [(2 * self.g * self.hs ** 2 * self.m * self.ms - self.hs * self.ks * self.ls ** 2 * self.ms) / den], [0], [0],
-                        [(self.ks * self.ls ** 2 * self.m - 2 * self.g * self.hs * self.m * self.m) / den]])
+        
+        # den = self.m**2*self.hs**2+self.ms*self.m*self.hs**2+self.ixx*self.m
+        # Af = np.array([[0,1,0,0,0],
+        #                [0,0,-u,(0.5*self.hs*self.ks*self.ls**2*self.ms-self.g*self.hs**2*self.m*self.ms)/den, self.bs*self.hs*self.ls**2*self.ms/den],
+        #                [0,0,0,0,0],
+        #                [0,0,0,0,1],
+        #                [0,0,0,(self.g*self.hs*self.m**2-self.ks*0.5*self.ls**2*self.m)/den, -self.bs*self.ls**2*self.m/2/den]])
+        # Bf = np.array([[0,0,0],
+        #                [0,self.ixx/den+self.hs**2*self.m/den,0],
+        #                [0,0,1/self.iz],
+        #                [0,0,0],
+        #                [0,self.m*self.hs/den,0]])
+        # Cpr = np.array([[0],
+        #                 [-self.g*self.ixx*self.m/den-self.g*self.hs**2*self.m**2/den],
+        #                 [0],
+        #                 [0],
+        #                 [-self.g*self.hs*self.m**2/den]])
 
+        den = self.m**2*self.hs**2+self.ms*self.m*self.hs**2+self.ixx*self.m
+        Af = np.array([[0,1,0,0,0],
+                       [0,0,-u,(0.5*self.hs*self.ks*self.ls**2*self.ms-self.g*self.hs**2*self.m*self.ms)/den, 0.5*self.bs*self.hs*self.ls**2*self.ms/den],
+                       [0,0,0,0,0],
+                       [0,0,0,0,1],
+                       [0,0,0,(self.g*self.hs*self.m**2-self.ks*0.5*self.ls**2*self.m)/den, -self.bs*self.ls**2*self.m/2/den]])
+        Bf = np.array([[0,0,0],
+                       [0,self.ixx/den+self.hs**2*self.m/den,0],
+                       [0,0,1/self.iz],
+                       [0,0,0],
+                       [0,self.m*self.hs/den,0]])
+        Cpr = np.array([[0],
+                        [2*self.g*self.hs**2*self.m*self.ms/den+self.g*self.hs**2*self.m**2/den+self.g*self.ixx*self.m/den],
+                        [0],
+                        [0],
+                        [-self.g*self.hs*self.m**2/den]])
+                        
+        '''
+        Testing with model from book by Pacejka
+        den = self.m**2*self.hs**2-self.ms*self.m*self.hs**2+self.ixx*self.m
+        Af = np.array([[0,1,0,0,0],
+                       [0,0,-u,(0.5*self.hs*self.ks*self.ls**2*self.ms-self.g*self.hs**2*self.m*self.ms)/den, self.bs*self.hs*self.ls**2*self.ms/den],
+                       [0,0,0,0,0],
+                       [0,0,0,0,1],
+                       [0,0,0,(self.g*self.hs*self.m**2-self.ks*0.5*self.ls**2*self.m)/den, -self.bs*self.ls**2*self.m/2/den]])
+        Bf = np.array([[0,0,0],
+                       [0,self.ixx/den+self.hs**2*self.m/den,0],
+                       [0,0,1/self.iz],
+                       [0,0,0],
+                       [0,-self.m*self.hs/den,0]])
+        Cpr = np.array([[0],
+                        [self.g*self.ixx*self.m/den+self.g*self.hs**2*self.m**2/den],
+                        [0],
+                        [0],
+                        [-self.g*self.hs*self.m**2/den]])
+                        '''
         # X_dot = AX+EW+BU+D+FPhir
         # W = wheel torque, steer angle for each wheel (8x1)
         # States are y v r phi, phi_dot (ignoring tyre dynamics)
         # U = change in wheel torque, change in steering angle for each tire
-        print(ca1)
-        print(ca2)
-        print(ca3)
-        print(ca4)
         Tw = block_diag(Tw1,Tw2,Tw3,Tw4)
         Lw = block_diag(Lw1, Lw2, Lw3, Lw4)
         B1 = np.hstack((B11.T, B12.T, B13.T, B14.T)).T
@@ -346,22 +394,21 @@ class Dallara_WMPC:
         Ed = self.Ts*E
         Dd = self.Ts*D
         Fd = self.Ts*F
-        print(self.sideslipangle)
         #Formulating Problem:
-        if np.abs(yd)>2.75:
-            self.Q[0,0] = 3
-            self.Q[2,2] = 40 # This is what I changed right now. If we increase it won't it make more effort? Yes after it gets into yd range it puts that much effort from what we just saw right. I see
+        if np.abs(yd)>3.0:
+            self.Q[0,0] = 2
+            self.Q[2,2] = 2 # This is what I changed right now. If we increase it won't it make more effort? Yes after it gets into yd range it puts that much effort from what we just saw right. I see
         else:
-            self.Q = self.OldQ
+        #    self.Q[0,0] = 10*(2.75-np.abs(yd))+150
+        #    self.Q[2,2] = 400*(2.75-np.abs(yd))+800
+             self.Q[0,0] = 15*(3.0-np.abs(yd))+25
+             self.Q[2,2] = 160*(3.0-np.abs(yd))+150
         Sx, Su, Sw, Sd, Sf = self.Sx_Su_Sw_Sd_Sf(Ad, Bd, Ed, Dd, Fd) ## Check blocks 2 and 3 below for explanation
         # We need a weighting matrix Q. I would say emphasis on tracking lateral position, then heading, then lateral velocity, with little concern for roll charact.
         PN = self.Q
         Q_temp = np.kron(np.eye(self.N),self.Q)
         Qbar  = block_diag(Q_temp,PN)
-        ##R = np.array(np.ones((8,1)))
-        ##R_temp = np.kron(np.eye(N), np.diag(R))
         Rbar = 1500* np.eye(nU*self.N)
-        ##Rbar = block_diag(R_temp)
 
         Wbar = np.kron(np.ones((1,self.N)), self.W0).T #W0 recieved from vehicle, vector of inputs at time zero #### check
         Xdbar = np.kron(np.ones((1,self.N+1)), xd.T).T
@@ -377,10 +424,21 @@ class Dallara_WMPC:
         P = H
         x0 = self.x0.reshape(5,1)
         q = x0.T@F1+Wbar.T@F2 +F3+ self.phir*F5+ Xdbar.T@F4 #x0 from vehicle, xdes from path planner
-        Ax= np.array([[0,0,1,0,0],[0,0,-1,0,0],[0,-1/u,self.lr/u,0,0],[0,1/u,-self.lr/u,0,0]])
-        bx = np.array([rmax, rmax, self.alphamax,self.alphamax]).reshape(4,1)
-        Af = np.array([[0,0,1,0,0],[0,0,-1,0,0],[0,-1/u,self.lr/u,0,0],[0,1/u,-self.lr/u,0,0]])
-        bf = np.array([rmax, rmax, self.alphamax,self.alphamax]).reshape(4,1)
+        # Ax= np.array([[0,0,1,0,0],[0,0,-1,0,0],[0,-1/u,self.lr/u,0,0],[0,1/u,-self.lr/u,0,0]])
+        # bx = np.array([rmax, rmax, self.alphamax,self.alphamax]).reshape(4,1)
+        # Af = np.array([[0,0,1,0,0],[0,0,-1,0,0],[0,-1/u,self.lr/u,0,0],[0,1/u,-self.lr/u,0,0]])
+        # bf = np.array([rmax, rmax, self.alphamax,self.alphamax]).reshape(4,1)
+
+        Ax= np.array([[0,-1/u,self.lr/u,0,0],[0,1/u,-self.lr/u,0,0]])
+        bx = np.array([self.alphamax,self.alphamax]).reshape(2,1)
+        Af = np.array([[0,-1/u,self.lr/u,0,0],[0,1/u,-self.lr/u,0,0]])
+        bf = np.array([ self.alphamax,self.alphamax]).reshape(2,1)
+
+
+        # Ax= np.array([[0,-1/u,self.lr/u,0,0],[0,1/u,-self.lr/u,0,0]])
+        # bx = np.array([np.inf,np.inf]).reshape(2,1)
+        # Af = np.array([[0,-1/u,self.lr/u,0,0],[0,1/u,-self.lr/u,0,0]])
+        # bf = np.array([np.inf,np.inf]).reshape(2,1)
 
         Au2 = np.array([[0,1,0,0,0,0,0,0],[0,0,0,1,0,0,0,0],[0,0,0,0,0,1,0,0],[0,0,0,0,0,0,0,1]])
         Au3 = np.array([[0,1,0,-1,0,0,0,0],[0,-1,0,1,0,0,0,0]])
@@ -390,7 +448,7 @@ class Dallara_WMPC:
         busip = self.deltamax*np.array([1,1,1,1])+np.array([self.W0[1],self.W0[3],self.W0[5],self.W0[7]])
         bufip = bufip.reshape(4,1)
         busip = busip.reshape(4,1)
-        bu = np.vstack((bufip,busip,0.01,0.01))
+        bu = np.vstack((bufip,busip,0.0001,0.0001))
 
         # Check Block 5
         G0_firstpart= block_diag(np.kron(np.eye(self.N),Au))
@@ -430,16 +488,52 @@ class Dallara_WMPC:
         qp['h']= H.sparsity()
         qp['a']=A.sparsity()
         try:
-            opts = {'printLevel': 'none'}
-            S = cas.conic('S', 'qpoases', qp, opts)
+            # opts = {'printLevel': 'none'}
+            S = cas.conic('S', 'osqp', qp)
             r = S(h=H, g=q, a=A, uba=uba)
             uOpt = r['x']
             JOpt = r['cost']
         except Exception as e:
+            print(e)
             uOpt = np.zeros((80,1))
         x_opt = Sx@x0+Su@uOpt+Sw@Wbar+Sd+Sf*self.phir 
-        print(x_opt)
-        print(self.x0)
         a = self.W0[1]+float(uOpt[1])
         self.lat_vel = x_opt[6]
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        a11 = [float(x_opt[5]),float(x_opt[6]),float(x_opt[7]),float(x_opt[8]),float(x_opt[9])]
+        # with open('example.csv', mode='a', newline='') as file:
+        #     # Create a writer object
+        #     writer = csv.writer(file)
+            
+        #     # Write the header row
+        #     writer.writerow(self.x0)
+        #     writer.writerow(self.xd)
+        #     writer.writerow(self.yd)
+        #     writer.writerow(self.speed)
+        #     writer.writerows(self.wheel_speed)
+        #     writer.writerow(self.yd/self.xd)
+        #     writer.writerow(self.mux)
+        #     writer.writerow(self.muy)
+        #     writer.writerow(self.phir)
+
+
+        #     """
+        #     self.xd = xd
+        #     self.yd = yd
+        #     self.speed = speed
+        #     self.sideslipangle = sideslipangle
+        #     self.wheel_speed = wheel_speed
+        #     self.mux = mux
+        #     self.muy = muy
+        #     self.W0 = W0
+        #     self.phir = phir # That's it right?
+        #     """
+
+        #     writer.writerow(a11)
+        print("Time elapsed:", elapsed_time, "seconds")
+        print(ca1)
+        print(ca2)
+        print(ca3)
+        print(ca4)
         return a
